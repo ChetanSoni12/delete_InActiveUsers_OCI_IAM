@@ -4,6 +4,7 @@ import base64
 import datetime
 import json
 from pathlib import Path
+import time
 
 import requests
 import urllib3
@@ -13,9 +14,10 @@ requests.packages.urllib3.util.ssl_ = "ALL:@SECLEVEL=1"
 
 
 class BatchDeleteExecutor:
-    REQUEST_TIMEOUT = (10, 120)
+    REQUEST_TIMEOUT = (10, 600)
     PREVIEW_DIR = Path("bulk_delete_payload_preview_inactive_only")
     LOG_FILE = Path("execute_inactive_only_batches.log")
+    INTER_BATCH_SLEEP_SECONDS = 2
 
     def __init__(self):
         with open("config.json", "r", encoding="utf-8") as config_file:
@@ -122,13 +124,62 @@ class BatchDeleteExecutor:
             )
             for batch_result in batch_results:
                 log_file.write(
-                    "batch={batch}, status={status}, operations={operations}\n".format(
+                    "batch={batch}, status={status}, operations={operations}, detail={detail}\n".format(
                         batch=batch_result["batch"],
                         status=batch_result["status"],
                         operations=batch_result["operations"],
+                        detail=batch_result.get("detail", ""),
                     )
                 )
             log_file.write("-" * 80 + "\n")
+
+    def _submit_batch(self, batch_file, payload):
+        operation_count = len(payload.get("Operations", []))
+        print(
+            "Submitting {batch} with {operations} delete operation(s)...".format(
+                batch=batch_file.name,
+                operations=operation_count,
+            )
+        )
+        print(
+            "Waiting for OCI IAM bulk delete response. Read timeout is set to {timeout} seconds.".format(
+                timeout=self.REQUEST_TIMEOUT[1],
+            )
+        )
+        try:
+            response = self.session.post(
+                self.idcs_url + "/admin/v1/Bulk",
+                headers=self.bulk_headers,
+                params={"forceDelete": True},
+                data=json.dumps(payload),
+                timeout=self.REQUEST_TIMEOUT,
+            )
+            return {
+                "batch": batch_file.name,
+                "status": response.status_code,
+                "operations": operation_count,
+                "detail": response.text[:1000],
+                "continue_execution": True,
+            }
+        except requests.exceptions.ReadTimeout:
+            return {
+                "batch": batch_file.name,
+                "status": "TIMEOUT_UNKNOWN",
+                "operations": operation_count,
+                "detail": (
+                    "Read timed out waiting for OCI IAM bulk delete response. "
+                    "Batch outcome is unknown, so execution was stopped to avoid duplicate delete submissions."
+                ),
+                "continue_execution": False,
+            }
+        except requests.exceptions.RequestException as exc:
+            return {
+                "batch": batch_file.name,
+                "status": "REQUEST_FAILED",
+                "operations": operation_count,
+                "detail": str(exc),
+                "continue_execution": False,
+            }
 
     def execute(self):
         batch_files = self._get_batch_files()
@@ -154,26 +205,21 @@ class BatchDeleteExecutor:
 
         batch_results = []
         for batch_file, payload in payloads:
-            response = self.session.post(
-                self.idcs_url + "/admin/v1/Bulk",
-                headers=self.bulk_headers,
-                params={"forceDelete": True},
-                data=json.dumps(payload),
-                timeout=self.REQUEST_TIMEOUT,
-            )
-            batch_results.append(
-                {
-                    "batch": batch_file.name,
-                    "status": response.status_code,
-                    "operations": len(payload.get("Operations", [])),
-                }
-            )
+            print("Starting execution for " + batch_file.name)
+            batch_result = self._submit_batch(batch_file, payload)
+            batch_results.append(batch_result)
             print(
                 "Executed {batch} with status {status}".format(
                     batch=batch_file.name,
-                    status=response.status_code,
+                    status=batch_result["status"],
                 )
             )
+            if not batch_result["continue_execution"]:
+                print(batch_result["detail"])
+                print("Stopping execution here so the same batch is not submitted again by accident.")
+                break
+            print("Batch {batch} completed successfully.".format(batch=batch_file.name))
+            time.sleep(self.INTER_BATCH_SLEEP_SECONDS)
 
         self._write_execution_log(selected_files, batch_results)
         print("Execution complete. Details written to " + str(self.LOG_FILE))
