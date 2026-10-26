@@ -33,6 +33,7 @@ class CSVUserDeletePreparer:
     PREVIEW_DIR = Path("bulk_delete_payload_preview_csv_users")
     REVIEW_FILE = Path("CSV_User_Deletion_Review.xlsx")
     LOG_FILE = Path("prepare_csv_user_deletion.log")
+    EXECUTION_LOG_FILE = Path("execute_csv_user_deletion.log")
     USERNAME_HEADERS = {"username", "user_name", "user name", "email"}
 
     def __init__(self, csv_path):
@@ -300,6 +301,85 @@ class CSVUserDeletePreparer:
                 log_file.write("AMBIGUOUS_SKIPPED: " + username + "\n")
             log_file.write("-" * 80 + "\n")
 
+    def _get_operation_status(self, operation_result):
+        status = operation_result.get("status", "")
+        if isinstance(status, dict):
+            status = status.get("code", "")
+        return str(status)
+
+    def _get_operation_detail(self, operation_result):
+        detail = operation_result.get("detail", "")
+        response_data = operation_result.get("response")
+        if not detail and isinstance(response_data, dict):
+            detail = response_data.get("detail", "")
+        if not detail and response_data:
+            detail = response_data
+        return detail
+
+    def _report_bulk_response(self, batch_number, response, requested_operations):
+        try:
+            response_json = response.json()
+        except ValueError:
+            response_json = {}
+
+        operation_results = response_json.get("Operations", [])
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        succeeded = 0
+        failed = 0
+
+        with self.EXECUTION_LOG_FILE.open("a", encoding="utf-8") as log_file:
+            log_file.write("Execution Timestamp: " + timestamp + "\n")
+            log_file.write("Batch: " + str(batch_number) + "\n")
+            log_file.write("Bulk HTTP Status: " + str(response.status_code) + "\n")
+
+            if not operation_results:
+                detail = response.text[:4000]
+                log_file.write("No per-operation results returned. Response: " + detail + "\n")
+                log_file.write("-" * 80 + "\n")
+                print("OCI returned no per-user operation statuses. Check " + str(self.EXECUTION_LOG_FILE))
+                return False
+
+            for index, operation_result in enumerate(operation_results):
+                status = self._get_operation_status(operation_result)
+                detail = self._get_operation_detail(operation_result)
+                requested_operation = requested_operations[index] if index < len(requested_operations) else {}
+                user_id = operation_result.get("bulkId") or requested_operation.get("bulkId", "UNKNOWN")
+                path = operation_result.get("path") or requested_operation.get("path", "")
+                is_success = status.startswith("2")
+
+                if is_success:
+                    succeeded += 1
+                else:
+                    failed += 1
+
+                result_line = (
+                    "user_id={user_id}, status={status}, path={path}, detail={detail}"
+                ).format(
+                    user_id=user_id,
+                    status=status or "UNKNOWN",
+                    path=path,
+                    detail=json.dumps(detail),
+                )
+                log_file.write(result_line + "\n")
+                print(result_line)
+
+            log_file.write(
+                "Succeeded: {succeeded}, Failed: {failed}\n".format(
+                    succeeded=succeeded,
+                    failed=failed,
+                )
+            )
+            log_file.write("-" * 80 + "\n")
+
+        print(
+            "Batch {batch} result: {succeeded} succeeded, {failed} failed.".format(
+                batch=batch_number,
+                succeeded=succeeded,
+                failed=failed,
+            )
+        )
+        return failed == 0 and succeeded == len(requested_operations)
+
     def prepare(self):
         requested_usernames, duplicate_usernames = self._read_usernames()
         matched_users, missing_usernames, ambiguous_usernames, domain_user_count = self._find_users(
@@ -328,7 +408,7 @@ class CSVUserDeletePreparer:
         print("Missing usernames: " + str(len(missing_usernames)))
         print("Duplicate CSV rows skipped: " + str(len(duplicate_usernames)))
         print("Bulk preview batches prepared: " + str(batch_count))
-        print("Actual bulk deletion is intentionally disabled.")
+        print("Preparation complete. No delete request has been submitted by the preparation stage.")
 
         # To enable deletion, remove the leading '# ' from every line between
         # LIVE DELETE BLOCK START and LIVE DELETE BLOCK END. Review the Excel
@@ -353,12 +433,14 @@ class CSVUserDeletePreparer:
         #         timeout=self.REQUEST_TIMEOUT,
         #     )
         #     response.raise_for_status()
-        #     print(
-        #         "Batch {batch} completed with HTTP status {status}.".format(
-        #             batch=batch_number,
-        #             status=response.status_code,
-        #         )
+        #     batch_succeeded = self._report_bulk_response(
+        #         batch_number,
+        #         response,
+        #         operation_batch,
         #     )
+        #     if not batch_succeeded:
+        #         print("Stopping because one or more delete operations failed or had an unknown result.")
+        #         break
         # LIVE DELETE BLOCK END
 
 
